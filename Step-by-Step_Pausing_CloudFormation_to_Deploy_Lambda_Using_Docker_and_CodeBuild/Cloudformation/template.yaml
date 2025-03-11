@@ -1,0 +1,326 @@
+Description: "Deploy a lambda function with a ecr source. Use a codebuild project to create the docker container and populate the ecr registry.
+              Makes use of cloudformation custom resources to pause the deploy and run the codebuild project "
+
+  
+Parameters:
+
+  SourceCodeRepoName:
+      Description: The name of the Github Repository which stores the code
+      Type: String
+      Default: "https://github.com/DionisioII/articles_code"
+
+  SourceCodeBranchName:
+      Description: The name of the  branch in the repo which stores the code
+      Type: String
+      Default: "main"
+
+  EcrImageRepo:
+      Description: The name of the ecr repo for lambda function source
+      Type: String
+      Default: "lambda-docker-source"
+
+  EcrImageRepoTag:
+      Description: The name of the ecr repo tag, usually latest
+      Type: String
+      Default: "latest"
+ 
+
+Resources:  
+
+  ECRRepository:
+      Type: AWS::ECR::Repository
+      Properties:
+        RepositoryName: !Ref EcrImageRepo
+        #ImageScanningConfiguration:
+         # ScanOnPush: true
+
+  codeBuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codeBuildProjectRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-s3cloudwatch"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - arn:aws:logs:*:*:*
+              - Sid: AllowECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:ListImages
+                  - ecr:*
+                  
+                Resource:
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*
+              
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  
+                Resource: 
+                  - "*"
+                  
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser"
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      Path: "/service-role/"
+
+
+  codeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: 
+      
+        - codeBuildProjectRole
+        - ECRRepository
+      
+    Properties:
+      Description: codebuild project to build lambda container.
+      ServiceRole: !GetAtt codeBuildProjectRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS #CodePipeLine #NO_ARTIFACTS #S3
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: false
+        EnvironmentVariables: 
+          - Name: PRESIGNED_URL
+            Type: PLAINTEXT
+            Value: "NONE" 
+          - Name: IMAGE_REPO_NAME
+            Type: PLAINTEXT
+            Value: !Ref EcrImageRepo
+          - Name: IMAGE_TAG
+            Type: PLAINTEXT
+            Value: !Ref  EcrImageRepoTag
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref  AWS::AccountId
+          - Name: AWS_DEFAULT_REGION
+            Type: PLAINTEXT
+            Value: !Ref  AWS::Region
+                   
+                          
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED #DISABLED #ENABLED
+      SourceVersion: !Ref SourceCodeBranchName
+      Source:
+        Type: GITHUB
+        Location: !Ref SourceCodeRepoName        
+        BuildSpec: !Sub
+            |
+              version: 0.2
+              phases:
+                install:
+                  runtime-versions:
+                    python: 3.12
+                  commands:
+                    - echo Logging in to Amazon ECR...
+                    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                    
+
+                
+                build:
+                  commands:
+                    - echo "YOUR BUILD LOGIC"
+                    - echo Build started on `date`
+                    - echo Building the Docker image... 
+                    - ls -la
+                    - cd "Step-by-Step_Pausing_CloudFormation_to_Deploy_Lambda_Using_Docker_and_CodeBuild/Code"
+
+                    - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG -f ./Dockerfile  .
+                    - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                    
+                
+                post_build:
+                  commands:
+
+                    - echo Build completed on `date`
+                    - echo Pushing the Docker image...
+                    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG       
+                    
+                    - |
+                        if [ "$PRESIGNED_URL"  != "NONE" ]; then
+                              
+                              curl -X PUT -H 'Content-Type:' --data-binary '{"Status" : "SUCCESS","Reason" : "Configuration Complete","UniqueId" : "ID1","Data" : "Application has completed configuration."}'  "$PRESIGNED_URL"
+                        fi
+                      
+  #####START CUSTOM RESOURCE SECTION TO LAUNCHE CODEBUILD PROJECT BEFORE CREATING LAMBDA FUNCTION#######################
+  CODEBUILDFISRTRUN:
+    Type: "Custom::CodebuildRun"
+    DependsOn: codeBuildProject
+    Properties:
+      ServiceToken: !GetAtt
+        - CustomCodeRunFunction
+        - Arn
+      Region: !Ref "AWS::Region"
+
+  
+  CustomCodeRunFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt
+        - CustomCodeRunFunctionRole
+        - Arn
+      Runtime: python3.9
+      Timeout: 90
+      Code:
+        ZipFile: !Sub |
+            import cfnresponse
+            import logging
+            import boto3
+            
+            # Init of the logging module
+            logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+            #Init Boto3 client
+            client = boto3.client('codebuild')
+
+            def lambda_handler(event, context):
+                if event.get('RequestType') == 'Create':
+                      response = client.start_build(projectName='${codeBuildProject}', 
+                      environmentVariablesOverride=[
+                                              {
+                                                  'name': 'PRESIGNED_URL',
+                                                  'value': '${WaitForCodebuildRunHandle}',
+                                                  'type': 'PLAINTEXT'
+                                              },
+                                          ])
+                      
+                      responseData = {}
+                      responseData['message'] = "build started" #str(response)
+                      logging.info('Response from codebuild: %s ', responseData['message'])
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                elif event.get('RequestType') == 'Delete':
+
+                      responseData = {}
+                      responseData['message'] = "Deleting stack"
+                      logging.info('Response from custom resource lambda on delete: %s ', responseData['message'])
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                else:
+                    logging.error('Unknown operation: %s', event.get('RequestType'))
+      #Environment:
+        #Variables:
+          #examplevar: example_value
+      
+  CustomCodeRunFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /lambda-service-roles/
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-customFunctionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeImages"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:RetryBuild"
+                  - "codebuild:ListBuilds"
+                Resource: "*"
+
+ #wait condition to wait for codebuild to finish first build #####
+  WaitForCodebuildRunHandle : 
+     Type : "AWS::CloudFormation::WaitConditionHandle"
+     
+
+  WaitForCodebuildRunCondition : 
+     Type : "AWS::CloudFormation::WaitCondition"
+     DependsOn: CODEBUILDFISRTRUN
+     Properties : 
+        Count: 1
+        Handle :  !Ref WaitForCodebuildRunHandle 
+        Timeout : "3600"
+#####END CUSTOM RESOURCE SECTION TO LAUNCHE CODEBUILD PROJECT BEFORE CREATING LAMBDA FUNCTION#######################
+
+  lambdaFunctionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  lambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+    
+      - WaitForCodebuildRunCondition
+    Properties:
+      PackageType: Image
+      Role:
+        Fn::GetAtt:
+        - lambdaFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          NUMBA_CACHE_DIR: "/tmp"
+          JOBLIB_MULTIPROCESSING: "0"
+      Code:
+        ImageUri:  !Join [
+                    ":",
+                    [
+                        !GetAtt ECRRepository.RepositoryUri,
+                        !Ref EcrImageRepoTag,
+                    ]
+                  ]
+        
+        
+      Architectures:
+        - x86_64
+      #MemorySize: 2048
+      #Timeout: 15
+
+Outputs:
+
+  lmbFunctionArn:
+    Value: !GetAtt  lambdaFunction.Arn
+    Export:
+      Name: "Lambda::Arn"
