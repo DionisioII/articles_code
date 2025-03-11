@@ -7,7 +7,7 @@ Parameters:
   SourceCodeRepoName:
       Description: The name of the Github Repository which stores the code
       Type: String
-      Default: "https://github.com/DionisioII/articles_code_support/tree/main/Step-by-Step_Pausing_CloudFormation_to_Deploy_Lambda_Using_Docker_and_CodeBuild"
+      Default: "https://github.com/DionisioII/articles_code_support"
 
   SourceCodeBranchName:
       Description: The name of the  branch in the repo which stores the code
